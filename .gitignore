@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bridge config with live MEXC API credentials - never commit
+config/config.json
