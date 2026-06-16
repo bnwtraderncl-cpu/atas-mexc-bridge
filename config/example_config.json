@@ -1,0 +1,28 @@
+{
+  "mexc": {
+    "api_key": "YOUR_MEXC_API_KEY_HERE",
+    "api_secret": "YOUR_MEXC_API_SECRET_HERE",
+    "base_url": "https://api.mexc.com",
+    "ws_url": "wss://wbs.mexc.com/ws"
+  },
+  "trading": {
+    "paper_trading": true,
+    "max_order_size_usd": 100.0,
+    "max_order_size": 0.01,
+    "max_open_orders": 5,
+    "allowed_symbols": ["BTCUSDT", "ETHUSDT"]
+  },
+  "http": {
+    "host": "127.0.0.1",
+    "port": 5000
+  },
+  "sync": {
+    "account_sync_interval_seconds": 30,
+    "ws_reconnect_delay_seconds": 5,
+    "listen_key_refresh_interval_seconds": 1800
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/bridge.log"
+  }
+}
