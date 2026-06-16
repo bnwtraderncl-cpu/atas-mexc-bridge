@@ -12,6 +12,24 @@
     "max_open_orders": 5,
     "allowed_symbols": ["BTCUSDT", "ETHUSDT"]
   },
+  "futures": {
+    "enabled": false,
+    "base_url": "https://contract.mexc.com",
+    "ws_url": "wss://contract.mexc.com/edge",
+    "trading": {
+      "paper_trading": true,
+      "max_order_size_usd": 100.0,
+      "max_order_size": 1,
+      "max_open_orders": 5,
+      "allowed_symbols": ["BTC_USDT", "ETH_USDT"],
+      "default_open_type": "ISOLATED",
+      "default_leverage": 5
+    },
+    "sync": {
+      "account_sync_interval_seconds": 30,
+      "ws_reconnect_delay_seconds": 5
+    }
+  },
   "http": {
     "host": "127.0.0.1",
     "port": 5000

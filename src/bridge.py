@@ -34,6 +34,13 @@ logger = logging.getLogger("atas_mexc_bridge")
 # validation without requiring a live exchangeInfo call.
 KNOWN_QUOTE_ASSETS = ("USDT", "USDC", "BTC", "ETH", "BNB")
 
+# MEXC contract (futures) v1 order side/type/margin-mode enums.
+FUTURES_SIDE_MAP = {"OPEN_LONG": 1, "CLOSE_SHORT": 2, "OPEN_SHORT": 3, "CLOSE_LONG": 4}
+FUTURES_ORDER_TYPE_MAP = {"LIMIT": 1, "MARKET": 5}
+FUTURES_OPEN_TYPE_MAP = {"ISOLATED": 1, "CROSS": 2}
+# Contract order states that mean the order is no longer open.
+FUTURES_TERMINAL_STATES = (3, 4, 5)  # completed, cancelled, invalid
+
 
 class BridgeError(Exception):
     """Base error for all bridge failures."""
@@ -84,6 +91,21 @@ class OrderRequest:
     order_type: str  # "LIMIT" or "MARKET"
     quantity: float
     price: Optional[float] = None
+    client_order_id: Optional[str] = None
+
+
+@dataclass
+class FuturesOrderRequest:
+    """Normalized representation of a futures order coming in from ATAS."""
+
+    symbol: str  # e.g. "BTC_USDT"
+    side: str  # "OPEN_LONG", "OPEN_SHORT", "CLOSE_LONG", or "CLOSE_SHORT"
+    order_type: str  # "LIMIT" or "MARKET"
+    vol: float
+    price: Optional[float] = None
+    leverage: Optional[int] = None
+    open_type: str = "ISOLATED"  # "ISOLATED" or "CROSS"
+    position_id: Optional[int] = None
     client_order_id: Optional[str] = None
 
 
@@ -180,6 +202,103 @@ class MexcClient:
 
     def keepalive_listen_key(self, listen_key: str) -> None:
         self._signed_request("PUT", "/api/v3/userDataStream", {"listenKey": listen_key})
+
+
+class MexcFuturesClient:
+    """Minimal signed REST client for the MEXC contract (futures) API.
+
+    Futures uses a different host and signing scheme than spot:
+    headers ApiKey/Request-Time/Signature, where
+    Signature = HMAC_SHA256(secret, apiKey + timestamp + paramString),
+    paramString being the sorted "k=v&k=v" query string for GET/DELETE,
+    or the exact JSON body string for POST.
+    """
+
+    def __init__(self, api_key: str, api_secret: str, base_url: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+
+    def _sign(self, timestamp: str, param_str: str) -> str:
+        target = f"{self.api_key}{timestamp}{param_str}"
+        return hmac.new(
+            self.api_secret.encode("utf-8"), target.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    def _headers(self, timestamp: str, param_str: str) -> dict:
+        return {
+            "ApiKey": self.api_key,
+            "Request-Time": timestamp,
+            "Signature": self._sign(timestamp, param_str),
+            "Content-Type": "application/json",
+        }
+
+    def login_signature(self) -> tuple:
+        """Returns (timestamp, signature) for the WS login message."""
+        timestamp = str(int(time.time() * 1000))
+        return timestamp, self._sign(timestamp, "")
+
+    def _signed_get(self, path: str, params: Optional[dict] = None) -> dict:
+        params = params or {}
+        timestamp = str(int(time.time() * 1000))
+        param_str = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        headers = self._headers(timestamp, param_str)
+
+        url = f"{self.base_url}{path}"
+        response = self.session.get(url, params=params, headers=headers, timeout=10)
+        return self._parse_response(response, "GET", path)
+
+    def _signed_post(self, path: str, body) -> dict:
+        timestamp = str(int(time.time() * 1000))
+        param_str = json.dumps(body, separators=(",", ":"))
+        headers = self._headers(timestamp, param_str)
+
+        url = f"{self.base_url}{path}"
+        response = self.session.post(
+            url, data=param_str.encode("utf-8"), headers=headers, timeout=10
+        )
+        return self._parse_response(response, "POST", path)
+
+    def _parse_response(self, response, method: str, path: str) -> dict:
+        if not response.ok:
+            raise BridgeError(
+                f"MEXC futures API error {response.status_code} on {method} {path}: "
+                f"{response.text}"
+            )
+        body = response.json()
+        if not body.get("success", False):
+            raise BridgeError(f"MEXC futures API rejected {method} {path}: {body}")
+        return body
+
+    def place_order(self, order: FuturesOrderRequest) -> dict:
+        body = {
+            "symbol": order.symbol,
+            "side": FUTURES_SIDE_MAP[order.side],
+            "type": FUTURES_ORDER_TYPE_MAP[order.order_type],
+            "vol": order.vol,
+            "openType": FUTURES_OPEN_TYPE_MAP[order.open_type],
+        }
+        if order.price is not None:
+            body["price"] = order.price
+        if order.leverage is not None:
+            body["leverage"] = order.leverage
+        if order.position_id is not None:
+            body["positionId"] = order.position_id
+        if order.client_order_id:
+            body["externalOid"] = order.client_order_id
+
+        return self._signed_post("/api/v1/private/order/submit", body)
+
+    def get_assets(self) -> list:
+        return self._signed_get("/api/v1/private/account/assets").get("data", [])
+
+    def get_open_orders(self, symbol: str) -> list:
+        result = self._signed_get(f"/api/v1/private/order/list/open_orders/{symbol}")
+        return result.get("data", [])
+
+    def cancel_order(self, order_id) -> dict:
+        return self._signed_post("/api/v1/private/order/cancel", [order_id])
 
 
 class AccountSync:
@@ -314,6 +433,153 @@ class AccountSync:
         logger.info("WebSocket closed (%s): %s", status_code, msg)
 
 
+class FuturesAccountSync:
+    """Maintains a live AccountState via MEXC's futures private WebSocket stream."""
+
+    def __init__(
+        self,
+        client: MexcFuturesClient,
+        ws_url: str,
+        state: AccountState,
+        sync_config: dict,
+        symbols: Optional[list] = None,
+    ):
+        self.client = client
+        self.ws_url = ws_url
+        self.state = state
+        self.sync_config = sync_config
+        self.symbols = symbols or []
+        self._ws: Optional[websocket.WebSocketApp] = None
+        self._stop_event = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._connected = threading.Event()
+
+    def start(self) -> None:
+        self._refresh_snapshot()
+
+        ws_thread = threading.Thread(target=self._run_ws_loop, daemon=True)
+        ws_thread.start()
+        self._threads.append(ws_thread)
+
+        poll_thread = threading.Thread(target=self._run_poll_loop, daemon=True)
+        poll_thread.start()
+        self._threads.append(poll_thread)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._connected.clear()
+        if self._ws:
+            self._ws.close()
+
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
+
+    def _refresh_snapshot(self) -> None:
+        try:
+            for asset in self.client.get_assets():
+                self.state.update_balance(
+                    asset["currency"],
+                    float(asset.get("availableBalance", 0.0)),
+                    float(asset.get("frozenBalance", 0.0)),
+                )
+            for symbol in self.symbols:
+                for order in self.client.get_open_orders(symbol):
+                    self.state.upsert_order(str(order["orderId"]), order)
+            logger.info("Futures account snapshot refreshed")
+        except BridgeError as exc:
+            logger.error("Failed to refresh futures account snapshot: %s", exc)
+
+    def _run_poll_loop(self) -> None:
+        interval = self.sync_config.get("account_sync_interval_seconds", 30)
+        while not self._stop_event.wait(interval):
+            self._refresh_snapshot()
+
+    def _run_ws_loop(self) -> None:
+        reconnect_delay = self.sync_config.get("ws_reconnect_delay_seconds", 5)
+        while not self._stop_event.is_set():
+            try:
+                self._ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self._ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception:
+                logger.exception("Futures WebSocket loop crashed")
+
+            if not self._stop_event.is_set():
+                logger.warning(
+                    "Futures WebSocket disconnected, reconnecting in %ss", reconnect_delay
+                )
+                self._stop_event.wait(reconnect_delay)
+
+    def _on_open(self, ws) -> None:
+        timestamp, signature = self.client.login_signature()
+        login_msg = {
+            "method": "login",
+            "param": {
+                "apiKey": self.client.api_key,
+                "reqTime": timestamp,
+                "signature": signature,
+            },
+        }
+        ws.send(json.dumps(login_msg))
+        logger.info("Sent futures WS login")
+
+    def _on_message(self, _ws, message: str) -> None:
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            logger.warning("Received non-JSON futures WS message")
+            return
+
+        channel = data.get("channel", "")
+
+        if channel == "rs.login":
+            if data.get("data") == "success":
+                self._connected.set()
+                logger.info("Futures WS login confirmed")
+            else:
+                logger.error("Futures WS login failed: %s", data)
+            return
+
+        if not channel.startswith("push."):
+            logger.debug("Unhandled futures WS message: %s", data)
+            return
+
+        kind = channel.rsplit(".", 1)[-1]
+        payload = data.get("data", {})
+
+        if kind == "asset":
+            self.state.update_balance(
+                payload.get("currency"),
+                float(payload.get("availableBalance", 0.0)),
+                float(payload.get("frozenBalance", 0.0)),
+            )
+        elif kind == "order":
+            order_id = str(payload.get("orderId"))
+            if payload.get("state") in FUTURES_TERMINAL_STATES:
+                self.state.remove_order(order_id)
+            else:
+                self.state.upsert_order(order_id, payload)
+        elif kind == "position":
+            symbol = payload.get("symbol")
+            if symbol:
+                with self.state.lock:
+                    self.state.positions[symbol] = payload
+        else:
+            logger.debug("Unhandled futures push channel: %s", channel)
+
+    def _on_error(self, _ws, error) -> None:
+        logger.error("Futures WebSocket error: %s", error)
+
+    def _on_close(self, _ws, status_code, msg) -> None:
+        self._connected.clear()
+        logger.info("Futures WebSocket closed (%s): %s", status_code, msg)
+
+
 def split_symbol(symbol: str) -> Optional[tuple]:
     """Split a MEXC symbol like 'BTCUSDT' into (base, quote), or None if unrecognized."""
     for quote in KNOWN_QUOTE_ASSETS:
@@ -420,6 +686,96 @@ class OrderRouter:
         return {"status": "LIVE_SUBMITTED", "paper_trading": False, "order": result}
 
 
+class FuturesOrderRouter:
+    """Validates incoming futures orders and routes them to MEXC, or to a paper log."""
+
+    def __init__(self, client: MexcFuturesClient, trading_config: dict, state: AccountState):
+        self.client = client
+        self.trading_config = trading_config
+        self.state = state
+        self.paper_trading = trading_config.get("paper_trading", True)
+        self._lock = threading.Lock()
+
+    def validate(self, order: FuturesOrderRequest) -> None:
+        allowed_symbols = self.trading_config.get("allowed_symbols")
+        if allowed_symbols and order.symbol not in allowed_symbols:
+            raise OrderValidationError(f"Symbol {order.symbol} is not in allowed_symbols")
+
+        if order.side not in FUTURES_SIDE_MAP:
+            raise OrderValidationError(f"Invalid futures side: {order.side}")
+
+        if order.order_type not in FUTURES_ORDER_TYPE_MAP:
+            raise OrderValidationError(f"Invalid order type: {order.order_type}")
+
+        if order.open_type not in FUTURES_OPEN_TYPE_MAP:
+            raise OrderValidationError(f"Invalid open_type: {order.open_type}")
+
+        if order.vol <= 0:
+            raise OrderValidationError("vol must be positive")
+
+        max_order_size = self.trading_config.get("max_order_size")
+        if max_order_size and order.vol > max_order_size:
+            raise OrderValidationError(
+                f"Order vol {order.vol} exceeds max_order_size {max_order_size}"
+            )
+
+        if order.order_type == "LIMIT":
+            if order.price is None or order.price <= 0:
+                raise OrderValidationError("LIMIT orders require a positive price")
+            notional = order.vol * order.price
+            max_size_usd = self.trading_config.get("max_order_size_usd")
+            if max_size_usd and notional > max_size_usd:
+                raise OrderValidationError(
+                    f"Order notional {notional:.2f} exceeds max_order_size_usd {max_size_usd}"
+                )
+
+            if order.side in ("OPEN_LONG", "OPEN_SHORT"):
+                leverage = order.leverage or 1
+                required_margin = notional / leverage
+                available = self.state.snapshot()["balances"].get("USDT", {}).get("free", 0.0)
+                if available < required_margin:
+                    raise OrderValidationError(
+                        f"Insufficient USDT margin: need {required_margin:.8f}, "
+                        f"have {available:.8f}"
+                    )
+
+        max_open = self.trading_config.get("max_open_orders")
+        if max_open is not None and len(self.state.snapshot()["open_orders"]) >= max_open:
+            raise OrderValidationError(f"max_open_orders ({max_open}) reached")
+
+    def route_order(self, order: FuturesOrderRequest) -> dict:
+        """Thread-safe entry point: validate then send the order."""
+        with self._lock:
+            return self.route(order)
+
+    def route(self, order: FuturesOrderRequest) -> dict:
+        """Validate then send the order. Returns a confirmation dict."""
+        self.validate(order)
+
+        if self.paper_trading:
+            logger.info("[PAPER][FUTURES] Order accepted, not sent to MEXC: %s", order)
+            return {
+                "status": "PAPER_ACCEPTED",
+                "paper_trading": True,
+                "order": order.__dict__,
+            }
+
+        if not self.client.api_key or not self.client.api_secret:
+            raise LiveTradingDisabledError(
+                "Live trading requires a valid api_key/api_secret in config"
+            )
+
+        logger.info("Routing live futures order to MEXC: %s", order)
+        try:
+            result = self.client.place_order(order)
+        except BridgeError:
+            logger.exception("Futures order submission failed")
+            raise
+
+        logger.info("Futures order confirmed by MEXC: %s", result)
+        return {"status": "LIVE_SUBMITTED", "paper_trading": False, "order": result}
+
+
 class BridgeHttpServer:
     """Flask HTTP server exposing the bridge to ATAS: /order, /status, /health."""
 
@@ -430,10 +786,16 @@ class BridgeHttpServer:
         sync: AccountSync,
         host: str = "127.0.0.1",
         port: int = 5000,
+        futures_router: Optional[FuturesOrderRouter] = None,
+        futures_state: Optional[AccountState] = None,
+        futures_sync: Optional[FuturesAccountSync] = None,
     ):
         self.router = router
         self.state = state
         self.sync = sync
+        self.futures_router = futures_router
+        self.futures_state = futures_state
+        self.futures_sync = futures_sync
         self.start_time = time.time()
 
         self.app = Flask("atas_mexc_bridge")
@@ -491,26 +853,87 @@ class BridgeHttpServer:
                 }
             )
 
+        if self.futures_router is not None:
+
+            @app.post("/futures/order")
+            def post_futures_order():
+                payload = request.get_json(silent=True) or {}
+                symbol = payload.get("symbol")
+                side = payload.get("side")
+                price_raw = payload.get("price")
+                vol_raw = payload.get("quantity", payload.get("vol"))
+                leverage_raw = payload.get("leverage")
+                open_type = payload.get("openType", "ISOLATED")
+                logger.info(
+                    "Received POST /futures/order: symbol=%s side=%s vol=%s",
+                    symbol, side, vol_raw,
+                )
+
+                client_order_id = str(uuid.uuid4())
+                try:
+                    if not symbol or not side or vol_raw is None:
+                        raise OrderValidationError("symbol, side, and quantity are required")
+                    vol = float(vol_raw)
+                    price = float(price_raw) if price_raw is not None else None
+                    leverage = int(leverage_raw) if leverage_raw is not None else None
+                    order = FuturesOrderRequest(
+                        symbol=symbol,
+                        side=side,
+                        order_type="LIMIT" if price is not None else "MARKET",
+                        vol=vol,
+                        price=price,
+                        leverage=leverage,
+                        open_type=open_type,
+                        client_order_id=client_order_id,
+                    )
+                    result = self.futures_router.route_order(order)
+                except (OrderValidationError, LiveTradingDisabledError) as exc:
+                    logger.warning("Futures order validation failed: %s", exc)
+                    return jsonify({"error": str(exc)}), 400
+                except (ValueError, TypeError, KeyError) as exc:
+                    logger.warning("Malformed futures order request: %s", exc)
+                    return jsonify({"error": f"Malformed order request: {exc}"}), 400
+                except BridgeError as exc:
+                    logger.error("Futures order submission failed: %s", exc)
+                    return jsonify({"error": str(exc)}), 502
+
+                logger.info("Futures order confirmed: %s", result)
+                order_id = result.get("order", {}).get("data") or client_order_id
+                return jsonify(
+                    {
+                        "orderId": str(order_id),
+                        "status": "PENDING",
+                        "timestamp": str(int(time.time() * 1000)),
+                    }
+                )
+
         @app.get("/status")
         def get_status():
             snapshot = self.state.snapshot()
-            return jsonify(
-                {
-                    "balance": snapshot["balances"],
-                    "open_orders": list(snapshot["open_orders"].values()),
-                    "listen_key_valid": self.sync.is_listen_key_valid(),
+            result = {
+                "balance": snapshot["balances"],
+                "open_orders": list(snapshot["open_orders"].values()),
+                "listen_key_valid": self.sync.is_listen_key_valid(),
+            }
+            if self.futures_state is not None:
+                futures_snapshot = self.futures_state.snapshot()
+                result["futures"] = {
+                    "balance": futures_snapshot["balances"],
+                    "positions": list(futures_snapshot["positions"].values()),
+                    "open_orders": list(futures_snapshot["open_orders"].values()),
                 }
-            )
+            return jsonify(result)
 
         @app.get("/health")
         def get_health():
-            return jsonify(
-                {
-                    "status": "running",
-                    "mexc_connected": self.sync.is_connected(),
-                    "uptime_seconds": round(time.time() - self.start_time, 1),
-                }
-            )
+            result = {
+                "status": "running",
+                "mexc_connected": self.sync.is_connected(),
+                "uptime_seconds": round(time.time() - self.start_time, 1),
+            }
+            if self.futures_sync is not None:
+                result["mexc_futures_connected"] = self.futures_sync.is_connected()
+            return jsonify(result)
 
     def start(self) -> None:
         self._thread.start()
@@ -541,6 +964,30 @@ class Bridge:
             self.client, mexc_config.get("ws_url"), self.state, self.config["sync"]
         )
 
+        futures_config = self.config.get("futures", {})
+        self.futures_enabled = futures_config.get("enabled", False)
+        self.futures_client = None
+        self.futures_state = None
+        self.futures_router = None
+        self.futures_sync = None
+        if self.futures_enabled:
+            self.futures_client = MexcFuturesClient(
+                api_key=mexc_config.get("api_key", ""),
+                api_secret=mexc_config.get("api_secret", ""),
+                base_url=futures_config.get("base_url", "https://contract.mexc.com"),
+            )
+            self.futures_state = AccountState()
+            self.futures_router = FuturesOrderRouter(
+                self.futures_client, futures_config.get("trading", {}), self.futures_state
+            )
+            self.futures_sync = FuturesAccountSync(
+                self.futures_client,
+                futures_config.get("ws_url", "wss://contract.mexc.com/edge"),
+                self.futures_state,
+                futures_config.get("sync", {}),
+                symbols=futures_config.get("trading", {}).get("allowed_symbols"),
+            )
+
         http_config = self.config.get("http", {})
         self.http_server = BridgeHttpServer(
             self.router,
@@ -548,6 +995,9 @@ class Bridge:
             self.sync,
             host=http_config.get("host", "127.0.0.1"),
             port=http_config.get("port", 5000),
+            futures_router=self.futures_router,
+            futures_state=self.futures_state,
+            futures_sync=self.futures_sync,
         )
 
         if self.config["trading"].get("paper_trading", True):
@@ -555,13 +1005,22 @@ class Bridge:
         else:
             logger.warning("Bridge running in LIVE TRADING mode. Real orders will be sent to MEXC.")
 
+        if self.futures_enabled:
+            futures_paper = futures_config.get("trading", {}).get("paper_trading", True)
+            mode = "PAPER TRADING" if futures_paper else "LIVE TRADING"
+            logger.warning("Futures trading enabled in %s mode.", mode)
+
         self.http_server.start()
 
     def start(self) -> None:
         self.sync.start()
+        if self.futures_enabled:
+            self.futures_sync.start()
 
     def stop(self) -> None:
         self.sync.stop()
+        if self.futures_enabled:
+            self.futures_sync.stop()
 
     def close(self) -> None:
         """Gracefully shut down the HTTP server and the MEXC WS/listen key sync."""

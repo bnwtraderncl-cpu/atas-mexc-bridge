@@ -72,12 +72,28 @@ unrecognized symbol format:
 A `502` means the order passed validation but MEXC itself rejected the
 live submission.
 
+### `POST /futures/order`
+
+Only registered when `futures.enabled` is `true` in config. Submit a
+futures order.
+
+Request body:
+```json
+{"symbol": "BTC_USDT", "side": "OPEN_LONG", "price": "50000", "quantity": "0.01", "leverage": 10}
+```
+
+`side` is one of `OPEN_LONG`, `OPEN_SHORT`, `CLOSE_LONG`, `CLOSE_SHORT`.
+Omit `price` for a market order. Response/error shape matches `POST /order`.
+
 ### `GET /status`
 
 Current account state, for ATAS to sync against:
 ```json
 {"balance": {...}, "open_orders": [...], "listen_key_valid": true}
 ```
+
+If futures is enabled, an extra `"futures"` key is included with its own
+`balance`, `positions`, and `open_orders`.
 
 ### `GET /health`
 
@@ -86,8 +102,9 @@ Bridge/connection health check:
 {"status": "running", "mexc_connected": true, "uptime_seconds": 123.4}
 ```
 
-`mexc_connected` reflects the live state of the user-data WebSocket, not
-just that the HTTP server is up.
+`mexc_connected` reflects the live state of the spot user-data WebSocket,
+not just that the HTTP server is up. If futures is enabled, an additional
+`mexc_futures_connected` field reflects the futures WebSocket.
 
 ## Manual setup (without setup.sh)
 
@@ -115,6 +132,12 @@ just that the HTTP server is up.
    - `http.host` / `http.port`: where the bridge's HTTP API listens
      (default `127.0.0.1:5000`).
    - `sync.*`: WebSocket reconnect/keepalive and REST polling intervals.
+   - `futures.enabled`: set `true` to also route futures orders. Uses the
+     same `mexc.api_key`/`mexc.api_secret` (MEXC keys can be scoped to
+     both Spot and Futures) against a separate host
+     (`contract.mexc.com`). `futures.trading.*` mirrors the spot
+     `trading.*` limits, plus `default_open_type`
+     (`ISOLATED`/`CROSS`) and `default_leverage`.
 
 3. **Never commit `config/config.json`** — it contains live API secrets.
    It's already listed in `.gitignore`, so a plain `git add` won't pick it
